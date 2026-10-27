@@ -1,0 +1,23 @@
+# Three-node cluster, N=3 R=2 W=2. Each node keeps its log on its own volume.
+x-node: &node
+  build: .
+  environment: &env
+    DKV_PEERS: n1=http://n1:8000,n2=http://n2:8000,n3=http://n3:8000
+    DKV_REPAIR_SECONDS: "2"
+services:
+  n1:
+    <<: *node
+    environment: { <<: *env, DKV_NODE_ID: n1 }
+    ports: ["8001:8000"]
+    volumes: [n1:/data]
+  n2:
+    <<: *node
+    environment: { <<: *env, DKV_NODE_ID: n2 }
+    ports: ["8002:8000"]
+    volumes: [n2:/data]
+  n3:
+    <<: *node
+    environment: { <<: *env, DKV_NODE_ID: n3 }
+    ports: ["8003:8000"]
+    volumes: [n3:/data]
+volumes: { n1: {}, n2: {}, n3: {} }
