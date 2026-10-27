@@ -2,6 +2,8 @@
 
     docker compose up -d --build && python scripts/e2e.py
 
+0. Concurrent writes through all three nodes at once: none may fail and no
+   hints may appear (every node is up, so a hint means a spurious timeout).
 1. 100 writes through n1, all readable through n3.
 2. Stop n3; 50 more writes still succeed (W=2) and are readable.
 3. Restart n3 (same volume): it recovers its log from disk, then hinted
@@ -11,6 +13,7 @@
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
@@ -38,6 +41,27 @@ def step(msg):
 for n in URL:
     wait_healthy(n)
 
+step("concurrent writers: 3 coordinators x 4 threads x 20 writes")
+CONCURRENT = 0
+
+
+def writer(args):
+    node, worker = args
+    failures = 0
+    for i in range(20):
+        r = httpx.put(f"{URL[node]}/kv/c-{node}-{worker}-{i}", content=b"x", timeout=10)
+        failures += r.status_code != 200
+    return failures
+
+
+t = time.perf_counter()
+with ThreadPoolExecutor(max_workers=12) as pool:
+    failed = sum(pool.map(writer, [(n, w) for n in URL for w in range(4)]))
+CONCURRENT = 3 * 4 * 20
+hints = {n: httpx.get(URL[n] + "/health").json()["pending_hints"] for n in URL}
+print(f"{CONCURRENT} writes in {time.perf_counter() - t:.1f}s, failed={failed}, hints={hints}")
+assert failed == 0 and not any(hints.values()), "spurious failures with every node up"
+
 step("100 writes via n1, read back via n3")
 for i in range(100):
     httpx.put(f"{URL['n1']}/kv/key{i}", content=f"v{i}".encode()).raise_for_status()
@@ -57,13 +81,13 @@ step("restart n3; it must catch up")
 compose("start", "n3")
 health = wait_healthy("n3")
 print("n3 keys right after restart (recovered from its log):", health["keys"])
-assert health["keys"] >= 100
+assert health["keys"] >= 100 + CONCURRENT
 deadline = time.time() + 60
-while time.time() < deadline and httpx.get(URL["n3"] + "/health").json()["keys"] < 150:
+while time.time() < deadline and httpx.get(URL["n3"] + "/health").json()["keys"] < 150 + CONCURRENT:
     time.sleep(1)
 health = httpx.get(URL["n3"] + "/health").json()
 print("n3 after repair:", health)
-assert health["keys"] == 150, health
+assert health["keys"] == 150 + CONCURRENT, health
 
 step("stop n2 and n3: writes must fail with 503")
 compose("stop", "n2", "n3")
