@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,9 @@ class Node:
         self.clock = clock or HybridClock()
         self.store = LogStore(Path(data_dir) / "data", fsync=fsync)
         self._hint_root = Path(data_dir) / "hints"
+        # Guards the set of hint stores: a request thread may add a hint while
+        # the repair thread is delivering and deleting that peer's store.
+        self._hint_lock = threading.Lock()
         self._hints: dict[str, LogStore] = {
             p.name: LogStore(p, fsync=fsync) for p in self._hint_root.glob("*") if p.is_dir()
         }
@@ -133,9 +137,10 @@ class Node:
                 self.stats["restamps"] += 1
                 continue
             break
-        for target in failed:  # hinted handoff: keep the write for each replica that missed it
-            self._hint_store(target).apply(Record(key, value, version))
-            self.stats["hints_stored"] += 1
+        with self._hint_lock:
+            for target in failed:  # hinted handoff: keep the write for each replica that missed it
+                self._hint_store(target).apply(Record(key, value, version))
+                self.stats["hints_stored"] += 1
         if acks < self.config.w:
             raise QuorumError("write", acks, self.config.w, failed)
         return version
@@ -175,27 +180,39 @@ class Node:
     # ---------- background repair ----------
 
     def deliver_hints(self) -> int:
-        """Replay stored hints to replicas that are reachable again. Returns how many were delivered."""
+        """Replay stored hints to replicas that are reachable again. Returns how many were delivered.
+
+        Delivery happens outside the lock (it does network I/O). A peer's hint
+        store is deleted only if it still holds exactly what was delivered;
+        if a new hint arrived meanwhile, the store is kept and redelivered
+        next round (replicas ignore versions they already have).
+        """
         delivered = 0
-        for target, hints in list(self._hints.items()):
-            pending = list(hints.records())
+        with self._hint_lock:
+            targets = list(self._hints.items())
+        for target, hints in targets:
+            with self._hint_lock:
+                pending = list(hints.records())
             try:
                 for rec in pending:
                     self._call(target, "replicate", record=to_wire(rec))
                     delivered += 1
             except NodeUnavailable:
                 continue
-            # Every hint reached the target: drop the hint log.
-            hints.close()
-            for f in hints.dir.glob("*"):
-                f.unlink()
-            hints.dir.rmdir()
-            del self._hints[target]
+            sent = {(r.key, r.version) for r in pending}
+            with self._hint_lock:
+                if {(r.key, r.version) for r in hints.records()} <= sent:
+                    hints.close()
+                    for f in hints.dir.glob("*"):
+                        f.unlink()
+                    hints.dir.rmdir()
+                    del self._hints[target]
         self.stats["hints_delivered"] += delivered
         return delivered
 
     def pending_hints(self) -> dict[str, int]:
-        return {t: sum(1 for _ in h.records()) for t, h in self._hints.items()}
+        with self._hint_lock:
+            return {t: sum(1 for _ in h.records()) for t, h in self._hints.items()}
 
     def _shared_records(self, peer: str) -> list[Record]:
         """Our latest records for keys that both we and `peer` should replicate."""

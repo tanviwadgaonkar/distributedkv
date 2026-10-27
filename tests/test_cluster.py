@@ -232,3 +232,34 @@ def test_randomised_reads_see_the_latest_successful_write(tmp_path, skewed):
     if skewed:
         assert sum(n.stats["restamps"] for n in cluster.nodes.values()) > 0
     cluster.close()
+
+
+def test_hint_added_during_delivery_is_not_lost(cluster):
+    """The repair thread snapshots a peer's hints, delivers them, then deletes the
+    store. A hint written by a request thread in between must survive."""
+    key, late = b"h1", b"h2"
+    down = cluster.replicas(key)[0]
+    coord = cluster.nodes[cluster.coordinator_outside(key)]
+    cluster.net.down.add(down)
+    coord.put(key, b"v1")
+    cluster.net.down.discard(down)
+
+    original = cluster.net._call
+    injected = []
+
+    def call_then_race(src, target, method, args):
+        result = original(src, target, method, args)
+        if method == "replicate" and target == down and not injected:
+            injected.append(True)  # simulate a concurrent put that hinted `down`
+            from dkv.storage import Record, Version
+            with coord._hint_lock:
+                coord._hint_store(down).apply(Record(late, b"v2", Version(coord.clock.now(), coord.id)))
+        return result
+
+    cluster.net._call = call_then_race
+    assert coord.deliver_hints() == 1
+    assert coord.pending_hints() == {down: 2}        # kept: it holds an undelivered hint
+    cluster.net._call = original
+    assert coord.deliver_hints() == 2                # both (re)delivered, then deleted
+    assert coord.pending_hints() == {}
+    assert cluster.nodes[down].store.get(late) == b"v2"
