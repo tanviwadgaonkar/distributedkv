@@ -30,7 +30,7 @@ import threading
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import BinaryIO, Iterator
 
 HEADER = struct.Struct("<IQHIi")
 TOMBSTONE = -1
@@ -102,6 +102,7 @@ class LogStore:
         self.max_segment_bytes = max_segment_bytes
         self._lock = threading.RLock()
         self._keydir: dict[bytes, _Location] = {}
+        self._readers: dict[int, BinaryIO] = {}  # one open read handle per segment
         self.recovered_truncated_bytes = 0
         for stale in self.dir.glob("*.tmp"):  # a compaction that crashed before publishing
             stale.unlink()
@@ -173,13 +174,21 @@ class LogStore:
                 return None
             if loc.segment == self._active_id:
                 self._active.flush()
-            with open(self._path(loc.segment), "rb") as fh:
-                fh.seek(loc.offset)
-                data = fh.read(loc.size)
+            fh = self._readers.get(loc.segment)
+            if fh is None:
+                fh = self._readers[loc.segment] = open(self._path(loc.segment), "rb")
+            fh.seek(loc.offset)
+            data = fh.read(loc.size)
         _, _, rec = next(_scan(data))
         if rec is None:
             raise CorruptionError(f"segment {loc.segment}: bad record at offset {loc.offset}")
         return rec
+
+    def version(self, key: bytes) -> Version | None:
+        """Version of the latest record for `key`, from memory (no disk read)."""
+        with self._lock:
+            loc = self._keydir.get(key)
+            return None if loc is None else loc.version
 
     def get(self, key: bytes) -> bytes | None:
         rec = self.get_record(key)
@@ -215,6 +224,7 @@ class LogStore:
             before = sum(p.stat().st_size for p in self.dir.glob(f"*{SEGMENT_SUFFIX}"))
             old = sorted(int(p.stem) for p in self.dir.glob(f"*{SEGMENT_SUFFIX}"))
             live = list(self.records())
+            self._close_readers()
             self._active.close()
             new_id = (old[-1] if old else 0) + 1
             tmp = self.dir / f"{new_id:010d}.tmp"
@@ -240,8 +250,14 @@ class LogStore:
             after = self._path(new_id).stat().st_size
             return {"bytes_before": before, "bytes_after": after, "records": len(keydir)}
 
+    def _close_readers(self) -> None:
+        for fh in self._readers.values():
+            fh.close()
+        self._readers.clear()
+
     def close(self) -> None:
         with self._lock:
+            self._close_readers()
             self._active.close()
 
     def __enter__(self) -> "LogStore":
