@@ -20,6 +20,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
 
 from dkv.node import Config, Node, QuorumError
 from dkv.ring import HashRing
@@ -121,8 +122,12 @@ def create_app(node: Node | None = None, repair_seconds: float | None = None) ->
         body = await request.body()
         if len(body) > MAX_VALUE_BYTES:
             raise HTTPException(413, "value larger than 1 MiB")
+        # put() makes blocking calls to other nodes. Running it on the event
+        # loop would freeze this node's /internal endpoints meanwhile, so two
+        # nodes coordinating writes through each other would each wait for
+        # the other's timeout. Run blocking work in the thread pool.
         try:
-            v = n().put(key.encode(), body)
+            v = await run_in_threadpool(n().put, key.encode(), body)
         except QuorumError as exc:
             raise HTTPException(503, str(exc)) from exc
         return {"key": key, "version": f"{v.ts}:{v.node}"}
@@ -140,7 +145,7 @@ def create_app(node: Node | None = None, repair_seconds: float | None = None) ->
         if method not in INTERNAL_METHODS:
             raise HTTPException(404, "unknown method")
         args = await request.json()
-        return getattr(n(), "handle_" + method)(**args)
+        return await run_in_threadpool(getattr(n(), "handle_" + method), **args)
 
     return app
 
