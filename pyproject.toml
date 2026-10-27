@@ -1,0 +1,16 @@
+[project]
+name = "distributedkv"
+version = "0.1.0"
+description = "A fault-tolerant distributed key-value store: log-structured storage, consistent hashing, quorum replication"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+server = ["fastapi>=0.110,<1", "uvicorn>=0.29,<1", "httpx>=0.27,<1"]
+dev = ["pytest>=8,<9", "fastapi>=0.110,<1", "httpx>=0.27,<1"]
+
+[tool.setuptools]
+packages = ["dkv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
