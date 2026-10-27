@@ -72,7 +72,20 @@ What it does **not** do (yet):
 
 ## Results
 
-Measured on a GitHub-hosted runner by the [CI benchmark job](.github/workflows/ci.yml); see the job summary of the latest run. <!-- BENCHMARK -->
+From [CI run 40498503210](https://github.com/tanviwadgaonkar/distributedkv/actions/runs/40498503210) on a GitHub-hosted `ubuntu-latest` runner (`python scripts/bench.py`; 100-byte values, Python 3.12, single thread, **in-process: no network**, so the cluster rows measure engine + replication logic, not HTTP):
+
+| Operation | Ops | Ops/s | p50 µs | p99 µs |
+|---|---|---|---|---|
+| LogStore put (no fsync) | 20,000 | 134,989 | 7 | 21 |
+| LogStore get | 20,000 | 204,444 | 5 | 9 |
+| LogStore put (fsync every write) | 2,000 | 3,226 | 281 | 653 |
+| Recovery: reopen 20,000 keys | | 80 ms total | | |
+| Cluster put (N=3, W=2) | 5,000 | 23,423 | 40 | 82 |
+| Cluster get (N=3, R=2) | 5,000 | 24,330 | 39 | 65 |
+
+fsync dominates write latency (about 40× slower), which is why it is configurable. A real deployment would batch fsyncs (group commit), which is on the roadmap. Shared CI runners vary between runs; treat these as orders of magnitude.
+
+**Failure recovery, real containers** (same run, `scripts/e2e.py` against `docker compose`): with `n3` stopped, 50 writes succeeded in 1.3 s and `n1` held 50 hints for it. After `n3` restarted it had its 100 earlier keys from its own log, and caught up to all 150 within the repair interval (hints delivered, pending hints empty). With `n2` and `n3` both stopped, a write returned `503 write: 1/2 replicas answered`.
 
 ## Run it
 
@@ -107,5 +120,6 @@ python scripts/bench.py         # engine + in-process cluster throughput
 - [x] HTTP server, Docker Compose cluster, failure-recovery e2e in CI
 - [ ] Runtime membership (join/leave with key streaming) via gossip
 - [ ] Parallel fan-out to replicas (currently sequential per request)
+- [ ] Group commit (batched fsync)
 - [ ] Hierarchical Merkle trees and incremental digests
 - [ ] Jepsen-style history checker for the randomised tests
