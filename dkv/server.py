@@ -6,6 +6,8 @@ Configuration (environment):
     DKV_DATA      data directory (default ./data/<id>)
     DKV_N, DKV_R, DKV_W              replication settings (default 3/2/2)
     DKV_REPAIR_SECONDS               hint delivery + anti-entropy interval (default 5, 0 = off)
+    DKV_FSYNC                        1 = fsync every write (survives power loss, ~40x slower writes);
+                                     default 0 = survives process crashes only
 
 Run:  uvicorn dkv.server:app --port 8000
 """
@@ -59,11 +61,12 @@ def parse_peers(spec: str) -> dict[str, str]:
     return peers
 
 
-def build_node(node_id: str, peers: dict[str, str], data_dir: str, config: Config, transport=None) -> Node:
+def build_node(node_id: str, peers: dict[str, str], data_dir: str, config: Config, transport=None,
+               fsync: bool = False) -> Node:
     ring = HashRing()
     for nid in peers:
         ring.add(nid)
-    return Node(node_id, data_dir, ring, transport or HttpTransport(peers), config)
+    return Node(node_id, data_dir, ring, transport or HttpTransport(peers), config, fsync=fsync)
 
 
 def repair_loop(node: Node, interval: float, stop: threading.Event) -> None:
@@ -88,7 +91,8 @@ def create_app(node: Node | None = None, repair_seconds: float | None = None) ->
             nid = os.environ["DKV_NODE_ID"]
             cfg = Config(int(os.getenv("DKV_N", 3)), int(os.getenv("DKV_R", 2)), int(os.getenv("DKV_W", 2)))
             state["node"] = build_node(nid, parse_peers(os.environ["DKV_PEERS"]),
-                                       os.getenv("DKV_DATA", f"data/{nid}"), cfg)
+                                       os.getenv("DKV_DATA", f"data/{nid}"), cfg,
+                                       fsync=os.getenv("DKV_FSYNC", "0") == "1")
         interval = repair_seconds if repair_seconds is not None else float(os.getenv("DKV_REPAIR_SECONDS", 5))
         stop = threading.Event()
         if interval > 0:

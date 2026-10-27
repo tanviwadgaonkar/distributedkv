@@ -1,8 +1,10 @@
 # DistributedKV
 
-A fault-tolerant, leaderless distributed key-value store in Python, built from first principles: a log-structured storage engine, consistent hashing, quorum replication, hinted handoff, read repair and Merkle-style anti-entropy. The design follows Amazon's [Dynamo paper](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf) (DeCandia et al., 2007) and Bitcask.
+A key-value store that keeps accepting reads and writes when a machine crashes or the network splits, as long as a quorum of replicas is reachable, and that brings lagging replicas back in sync afterwards. It is a from-scratch Python implementation of the core ideas in Amazon's [Dynamo paper](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf) (DeCandia et al., 2007) and the Bitcask storage design, built to study the failure cases rather than to replace a real database.
 
-Every failure mode below is covered by a test that injects it: node crashes, torn writes, corrupted logs, network partitions, clock skew, and lost hints.
+**Stack:** Python 3.11+ (standard library only for the engine and replication), FastAPI + httpx for the node HTTP API, Docker Compose for a 3-node cluster, pytest, GitHub Actions.
+
+**Status:** implemented and tested. The unit and integration tests run in-process with injected failures. A CI job also runs a real 3-container cluster and stops and restarts nodes. Not deployed, and not production-ready (see *Guarantees and limits*).
 
 ## Architecture
 
@@ -56,15 +58,27 @@ flowchart TB
 
 **Anti-entropy compares digests first.** Two nodes hash the `(key, version)` pairs they both replicate into 64 buckets (a one-level Merkle tree) and exchange records only for buckets that differ. A second pass over an in-sync pair transfers nothing.
 
+## Bugs found by testing (and how they were proven)
+
+These are worth reading because neither showed up in the in-process test suite at first:
+
+1. **Writes lost under clock skew.** A coordinator whose wall clock was behind could stamp a later write with a lower version than an already-acknowledged one, so the later write silently lost. Fixed by having replicas report newer versions back so the coordinator re-stamps. The randomised test with 2 s of skew fails without the fix.
+2. **Cross-node stall under concurrent writes.** The HTTP endpoint for `PUT` was `async` but made blocking calls to peers, which froze that node's event loop. Two nodes coordinating writes through each other each waited for the other's timeout. The in-process tests could not see this, because it depends on how uvicorn schedules requests. The real-container e2e test reproduced it once concurrent writers were added (CI run [40543562657](https://github.com/tanviwadgaonkar/distributedkv/actions/runs/40543562657): client timeout). Fixed by running blocking work in the thread pool. After the fix (run [40543824067](https://github.com/tanviwadgaonkar/distributedkv/actions/runs/40543824067)), 240 concurrent writes through all three nodes took 2.5 s with 0 failures and 0 spurious hints.
+3. **Hints lost during delivery.** The repair thread deleted a peer's whole hint store after delivering a snapshot of it, so a hint added by a concurrent request in between was lost. Now a store is deleted only if it holds exactly what was delivered. A regression test fails on the old code.
+
 ## Guarantees and limits
 
 What the tests show (with R + W > N, at most N − W replicas down, stable membership):
 - An acknowledged write is readable from any coordinator, and a read returns the latest acknowledged write. This is checked over 300 random steps with random node failures, with and without clock skew.
 - A replica that missed writes converges via hints, read repair or anti-entropy.
-- Data survives process restarts; torn writes are discarded; corruption is detected.
+- Data survives process crashes and restarts; torn writes are discarded; corruption is detected. **Power loss** is only covered with `DKV_FSYNC=1` (fsync per write, about 40× slower; see Results). The default does not fsync, so an acknowledged write can be lost if the machine loses power before the OS flushes it.
 
 What it does **not** do (yet):
 - **Membership changes at runtime.** The ring is fixed at start-up from `DKV_PEERS`. Adding a node needs a restart, and keys are not streamed to a new owner except through anti-entropy.
+- **A failed write is not undone.** If fewer than W replicas acknowledge, the client gets `503`, but the replicas that did apply it keep it, and hints carry it to the others later. A "failed" write can therefore become visible. This is the same trade-off as Dynamo and Cassandra.
+- **Automatic compaction.** `LogStore.compact()` exists and is tested, but the server never calls it, so the log grows with every overwrite.
+- **Independent deployment.** Tested as separate processes only in Docker Compose on one CI machine, not across real hosts or a lossy network.
+- **Keys** are URL path segments, so they cannot contain `/`.
 - **Linearizability.** Quorum reads/writes with LWW are not linearizable under concurrent writers or failures (no read-your-writes across coordinators during partitions, no compare-and-set).
 - **Tombstone garbage collection** is manual (`compact(drop_tombstones_older_than=...)`).
 - **Security.** No authentication or TLS on the client or internal API; run it on a private network.
@@ -91,9 +105,9 @@ fsync dominates write latency (about 40× slower), which is why it is configurab
 
 ```bash
 pip install -e ".[dev]"
-pytest -q                       # storage, ring, cluster (fault injection), HTTP: a few seconds, no network
+pytest -q                       # 37 tests: storage, ring, cluster (fault injection), HTTP; ~3 s, no network
 
-docker compose up -d --build    # 3 nodes on :8001-8003
+docker compose up -d --build    # 3 nodes on :8001-8003 (set DKV_FSYNC=1 for power-loss durability)
 curl -X PUT localhost:8001/kv/hello -d world
 curl localhost:8003/kv/hello    # -> world, read through another node
 docker compose stop n3          # writes still succeed (W=2); n1 stores hints for n3
@@ -110,7 +124,7 @@ python scripts/bench.py         # engine + in-process cluster throughput
 | `test_ring.py` | determinism, load balance with/without vnodes, ~1/N movement on join, only the leaver's keys move |
 | `test_cluster.py` | N-way placement, one/two replicas down, hinted handoff, read repair, delete vs. resurrection, anti-entropy (and its no-op second pass), restart with durable hints, partitions, concurrent writers converge, randomised latest-write check with and without clock skew |
 | `test_server.py` | HTTP round trip and versions, dead node → hints delivered over HTTP, no quorum → 503, size limit |
-| `scripts/e2e.py` (CI) | real 3-container cluster: stop / restart a node, recovery from its volume, catch-up, no-quorum 503 |
+| `scripts/e2e.py` (CI) | real 3-container cluster: 240 concurrent writes via all nodes, stop / restart a node, recovery from its volume, catch-up, no-quorum 503 |
 
 ## Roadmap
 
